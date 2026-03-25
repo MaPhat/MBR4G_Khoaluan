@@ -1,0 +1,1 @@
+python main.py --model_arch MBR_4G --config ./config/config_BoT_Veri776.yaml
