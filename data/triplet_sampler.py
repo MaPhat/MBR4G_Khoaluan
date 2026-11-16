@@ -434,6 +434,9 @@ class CustomDataSet4VehicleID_Random(Dataset):
         self.data_info = self.names        
         self.root_dir = root_dir
         self.transform = transform
+        # VehicleID has no camera labels. At test time use a dummy camera per split
+        # (query=0, gallery=1) so remove_junk never discards the true match.
+        self.test_camid = None if is_train else (1 if mode == 'g' else 0)
 
     def get_class(self, idx):
         return self.labels[idx]
@@ -450,7 +453,7 @@ class CustomDataSet4VehicleID_Random(Dataset):
         image = torchvision.io.read_image(img_name)
         vid = np.int64(self.labels[idx])
         ### no camera information
-        camid = idx #np.int64(self.cams[idx].replace('c', ""))
+        camid = idx if self.test_camid is None else self.test_camid
 
         if self.transform:
             img = self.transform((image.type(torch.FloatTensor))/255.0)
@@ -513,6 +516,9 @@ class CustomDataSet4VehicleID(Dataset):
         self.data_info = self.names        
         self.root_dir = root_dir
         self.transform = transform
+        # VehicleID has no camera labels. At test time use a dummy camera per split
+        # (query=0, gallery=1) so remove_junk never discards the true match.
+        self.test_camid = None if is_train else (1 if mode == 'g' else 0)
 
     def get_class(self, idx):
         return self.labels[idx]
@@ -528,7 +534,7 @@ class CustomDataSet4VehicleID(Dataset):
                                 self.names[idx]+ ".jpg")
         image = torchvision.io.read_image(img_name)
         vid = np.int64(self.labels[idx])
-        camid = idx #np.int64(self.cams[idx].replace('c', ""))
+        camid = idx if self.test_camid is None else self.test_camid
 
         if self.transform:
             img = self.transform((image.type(torch.FloatTensor))/255.0)

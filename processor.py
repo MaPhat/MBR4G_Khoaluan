@@ -1,11 +1,10 @@
-from turtle import update
 import torch
 import torch.nn.functional as F
 from models.models import MBR_model
 from tqdm import tqdm
 import numpy as np
 from metrics.eval_reid import eval_func
-from utils import GCNRefiner, graph_reranking, re_ranking, normalize_adj
+from utils import GCNRefiner, graph_reranking, re_ranking, build_graphs
 
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:
@@ -100,14 +99,28 @@ def get_model(data, device):
 
 
 
-def train_epoch(model, device, dataloader, loss_fn, triplet_loss, optimizer, data, alpha_ce, beta_tri, logger, epoch, scheduler=None, scaler=False, gcn_model=None):
-    # Set train mode for both the encoder and the decoder
+GCN_RECON_WEIGHT = 0.05
+
+
+def _as_list(x):
+    return list(x) if isinstance(x, (list, tuple)) else [x]
+
+
+def apply_gcn_train(gcn_model, ffs, cam, use_camera=True):
+    """Refine the global branch (ffs[0]) with LiteGCR on the training batch.
+    The other branches are kept unchanged. Returns (new_ffs, reconstruction loss)."""
+    global_feature = ffs[0]
+    A_g, A_c = build_graphs(global_feature, cam if use_camera else None)
+    refined = gcn_model(global_feature, A_g, A_c)
+    recon = F.mse_loss(refined, global_feature.detach().float())
+    return [refined] + ffs[1:], recon
+
+
+def train_epoch(model, device, dataloader, loss_fn, triplet_loss, optimizer, data, alpha_ce, beta_tri, logger, epoch, scheduler=None, scaler=False, gcn_model=None, use_camera=True):
     if gcn_model is not None:
         gcn_model.train()
-        # Store initial weight for comparison
         if epoch == 0:
-            initial_w_norm = gcn_model.W.data.norm().item()
-            print(f"==> GCN Initial W norm: {initial_w_norm:.4f}")
+            print(f"==> GCN Initial W norm: {gcn_model.W.data.norm().item():.4f}")
 
     model.train()
     train_loss = []
@@ -125,66 +138,24 @@ def train_epoch(model, device, dataloader, loss_fn, triplet_loss, optimizer, dat
     n_images = 0
     acc_v = 0
     stepcount = 0
-    for image_batch, label, cam, view in tqdm(dataloader, desc='Epoch ' + str(epoch+1) +' (%)'): 
-        # Move tensor to the proper device
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    for image_batch, label, cam, view in tqdm(dataloader, desc='Epoch ' + str(epoch+1) +' (%)'):
         loss_ce = 0
         loss_t = 0
         optimizer.zero_grad()
 
         image_batch = image_batch.to(device)
         label = label.to(device)
-        if scaler:
-            # Use appropriate device_type for autocast
-            device_type = "cuda" if device.type == "cuda" else "cpu"
-            with torch.autocast(device_type=device_type, dtype=torch.float16):
-
-                preds, embs, ffs, activations = model(image_batch, cam, view)
-                # print(len(embs))
-                # print(embs[0].shape)
-                if gcn_model is not None:
-                    global_feature = ffs[0]
-                    A_g, A_c = build_graphs_for_batch(global_feature, cam)
-                    A_g_norm = normalize_adj(A_g)
-                    A_c_norm = normalize_adj(A_c)
-                    refined_global = gcn_model(global_feature, A_g_norm, A_c_norm)
-                    gcn_recon_loss = torch.nn.functional.mse_loss(refined_global, global_feature)
-                    ffs = [refined_global]
-                loss = 0
-                #### Losses 
-                if type(preds) != list:
-                    preds = [preds]
-                    ffs = [ffs]
-                for i, item in enumerate(preds):
-                    if i%2==0 or "aseline" in model_arch or "R50" in model_arch:
-                        loss_ce += alpha_ce * loss_fn(item, label)
-                    else:
-                        loss_ce += gamma_ce * loss_fn(item, label)
-                for i, item in enumerate(ffs):
-                    if i%2==0 or "aseline" in model_arch or "R50" in model_arch:
-                        loss_t += beta_tri * triplet_loss(item, label)
-                    else:
-                        loss_t += gamma_t * triplet_loss(item, label)
-
-                if data['mean_losses']:
-                    loss = loss_ce/len(preds) + loss_t/len(ffs)
-                else:
-                    gcn_weight = 0.05
-                    loss = loss_ce + loss_t + gcn_recon_loss * gcn_weight
-        else:
+        with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=bool(scaler)):
             preds, embs, ffs, activations = model(image_batch, cam, view)
+            preds = _as_list(preds)
+            ffs = _as_list(ffs)
+
+            gcn_recon_loss = 0
             if gcn_model is not None:
-                global_feature = ffs[0]
-                A_g, A_c = build_graphs_for_batch(global_feature, cam)
-                A_g_norm = normalize_adj(A_g)
-                A_c_norm = normalize_adj(A_c)
-                refined_global = gcn_model(global_feature, A_g_norm, A_c_norm)
-                gcn_recon_loss = torch.nn.functional.mse_loss(refined_global, global_feature)
-                ffs = [refined_global]
-            loss = 0
-            #### Losses 
-            if type(preds) != list:
-                preds = [preds]
-                ffs = [ffs]
+                ffs, gcn_recon_loss = apply_gcn_train(gcn_model, ffs, cam, use_camera)
+
+            #### Losses
             for i, item in enumerate(preds):
                 if i%2==0 or "aseline" in model_arch or "R50" in model_arch:
                     loss_ce += alpha_ce * loss_fn(item, label)
@@ -195,17 +166,19 @@ def train_epoch(model, device, dataloader, loss_fn, triplet_loss, optimizer, dat
                     loss_t += beta_tri * triplet_loss(item, label)
                 else:
                     loss_t += gamma_t * triplet_loss(item, label)
+
             if data['mean_losses']:
                 loss = loss_ce/len(preds) + loss_t/len(ffs)
             else:
-                loss = loss_ce + loss_t + gcn_recon_loss * gcn_weight
+                loss = loss_ce + loss_t
+            loss = loss + GCN_RECON_WEIGHT * gcn_recon_loss
 
         ###Training Acurracy
         for prediction in preds:
             acc_v += torch.sum(torch.argmax(prediction, dim=1) == label)
             n_images += prediction.size(0)
         stepcount += 1
-    
+
         ### backward prop and optimizer step
         if scaler:
             scaler.scale(loss).backward()
@@ -214,19 +187,16 @@ def train_epoch(model, device, dataloader, loss_fn, triplet_loss, optimizer, dat
         else:
             loss.backward()
             optimizer.step()
-      
 
         loss_log.set_description_str(f'train loss : {loss.data:.3f}')
         loss_ce_log.set_description_str(f'CrossEntropy: {loss_ce.data:.3f}')
         loss_triplet_log.set_description_str(f'Triplet : {loss_t.data:.3f}')
 
-
         train_loss.append(loss.detach().cpu().numpy())
         ce_loss_log.append(loss_ce.detach().cpu().numpy())
         triplet_loss_log.append(loss_t.detach().cpu().numpy())
 
-
-        logger.write_scalars({  "Loss/train_total": np.mean(train_loss), 
+        logger.write_scalars({  "Loss/train_total": np.mean(train_loss),
                                 "Loss/train_crossentropy": np.mean(ce_loss_log),
                                 "Loss/train_triplet": np.mean(triplet_loss_log),
                                 "Loss/ce_loss_weight": alpha_ce,
@@ -237,152 +207,88 @@ def train_epoch(model, device, dataloader, loss_fn, triplet_loss, optimizer, dat
                                 write_epoch=True
                                 )
 
-
     print('\nTrain ACC (%): ', acc_v / n_images, "\n")
-    
+
     return np.mean(train_loss), np.mean(ce_loss_log), np.mean(triplet_loss_log), alpha_ce, beta_tri
 
 
+def embed_for_retrieval(ffs, keep_global_raw=False):
+    """Concatenate branch features into one descriptor (each branch L2-normalised).
+    With keep_global_raw=True the global branch (ffs[0]) is kept un-normalised so
+    LiteGCR receives the same kind of input it was trained on; it is normalised
+    after refinement inside graph_reranking."""
+    ffs = _as_list(ffs)
+    parts = [ffs[0].float() if keep_global_raw else F.normalize(ffs[0].float())]
+    parts += [F.normalize(item.float()) for item in ffs[1:]]
+    return torch.cat(parts, 1)
 
-def test_epoch(model, device, dataloader_q, dataloader_g, model_arch, writer, epoch, gcn_model=None, remove_junk=True, scaler=False, re_rank=False, graph_re_rank=False):
+
+def compute_distmat(qf, gf, q_camids, g_camids, gcn_model=None, re_rank=False, graph_re_rank=False, use_camera=True):
+    """LiteGCR (if gcn_model) > rule-based graph re-ranking > k-reciprocal > plain euclidean."""
+    if gcn_model is not None:
+        print("LiteGCR (learned) graph re-ranking")
+        return graph_reranking(qf, gf, q_camids, g_camids, gcn_model=gcn_model, use_camera=use_camera, normalize_rest=False)
+    if graph_re_rank:
+        print("Rule-based graph re-ranking")
+        return graph_reranking(qf, gf, q_camids, g_camids, use_camera=use_camera)
+    if re_rank:
+        print("k-reciprocal re-ranking")
+        return re_ranking(qf, gf, k1=80, k2=16, lambda_value=0.3)
+    print("None re-ranking")
+    m, n = qf.shape[0], gf.shape[0]
+    distmat = torch.pow(qf, 2).sum(dim=1, keepdim=True).expand(m, n) + \
+              torch.pow(gf, 2).sum(dim=1, keepdim=True).expand(n, m).t()
+    distmat.addmm_(qf, gf.t(), beta=1, alpha=-2)
+    return torch.sqrt(distmat.clamp_min(0)).cpu().numpy()
+
+
+def test_epoch(model, device, dataloader_q, dataloader_g, model_arch, writer, epoch, gcn_model=None, remove_junk=True, scaler=False, re_rank=False, graph_re_rank=False, use_camera=True):
     if gcn_model is not None:
         gcn_model.eval()
     model.eval()
-    ###needed lists
-    qf = []
-    gf = []
-    q_camids = []
-    g_camids = []
-    q_vids = []
-    g_vids = []
+    use_gcn = gcn_model is not None
+    qf, gf = [], []
+    q_camids, g_camids = [], []
+    q_vids, g_vids = [], []
     q_images = []
-    g_images =  []
+    device_type = "cuda" if device.type == "cuda" else "cpu"
 
     with torch.no_grad():
         for image, q_id, cam_id, view_id in tqdm(dataloader_q, desc='Query infer (%)', bar_format='{l_bar}{bar:20}{r_bar}'):
             image = image.to(device)
-            if scaler:
-                # Use appropriate device_type for autocast
-                device_type = "cuda" if device.type == "cuda" else "cpu"
-                with torch.autocast(device_type=device_type, dtype=torch.float16):
-                    _, _, ffs, _ = model(image, cam_id, view_id)
-            else:
+            with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=bool(scaler)):
                 _, _, ffs, _ = model(image, cam_id, view_id)
-
-            if gcn_model is not None:
-                global_feature = ffs[0]
-                A_g, A_c = build_graphs_for_batch(global_feature, cam_id)
-                A_g_norm = normalize_adj(A_g)
-                A_c_norm = normalize_adj(A_c)
-                refined_global = gcn_model(global_feature, A_g_norm, A_c_norm)
-                ffs = [refined_global]
-            end_vec = []
-            for item in ffs:
-                end_vec.append(F.normalize(item))
-            qf.append(torch.cat(end_vec, 1).detach().cpu())
-
+            qf.append(embed_for_retrieval(ffs, keep_global_raw=use_gcn).detach().cpu())
             q_vids.append(q_id.cpu())
             q_camids.append(cam_id.cpu())
-
-            if epoch == 119:  
+            if epoch == 119:
                 q_images.append(F.interpolate(image, (64,64)).cpu())
 
         #### TensorBoard emmbeddings for projector visualization
-        if epoch == 119:    
+        if epoch == 119:
             writer.write_embeddings(torch.cat(qf).cpu(), torch.cat(q_vids).cpu(), torch.cat(q_images)/2 + 0.5, 120, tag='Query embeddings')
-
         del q_images
 
-        for image, q_id, cam_id, view_id in tqdm(dataloader_g, desc='Gallery infer (%)', bar_format='{l_bar}{bar:20}{r_bar}'):
+        for image, g_id, cam_id, view_id in tqdm(dataloader_g, desc='Gallery infer (%)', bar_format='{l_bar}{bar:20}{r_bar}'):
             image = image.to(device)
-            if scaler:
-                # Use appropriate device_type for autocast
-                device_type = "cuda" if device.type == "cuda" else "cpu"
-                with torch.autocast(device_type=device_type, dtype=torch.float16):
-                    _, _, ffs, _ = model(image, cam_id, view_id)
-            else:
-                    _, _, ffs, _ = model(image, cam_id, view_id)
-
-            end_vec = []
-            if gcn_model is not None:
-                global_feature = ffs[0]
-                A_g, A_c = build_graphs_for_batch(global_feature, cam_id)
-                A_g_norm = normalize_adj(A_g)
-                A_c_norm = normalize_adj(A_c)
-                refined_global = gcn_model(global_feature, A_g_norm, A_c_norm)
-                ffs = [refined_global]
-            for item in ffs:
-                end_vec.append(F.normalize(item))
-            gf.append(torch.cat(end_vec, 1).detach().cpu())
-            g_vids.append(q_id.cpu())  # Variable name is q_id but it's actually gallery ID from dataloader_g
+            with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=bool(scaler)):
+                _, _, ffs, _ = model(image, cam_id, view_id)
+            gf.append(embed_for_retrieval(ffs, keep_global_raw=use_gcn).detach().cpu())
+            g_vids.append(g_id.cpu())
             g_camids.append(cam_id.cpu())
-        del g_images
 
     qf = torch.cat(qf, dim=0)
     gf = torch.cat(gf, dim=0)
     q_camids = torch.cat(q_camids, dim=0).cpu().numpy()
     g_camids = torch.cat(g_camids, dim=0).cpu().numpy()
-    m, n = qf.shape[0], gf.shape[0]
 
-    if re_rank:
-        print("Original re-ranking")
-        distmat = re_ranking(qf, gf, k1=80, k2=16, lambda_value=0.3)
-    elif graph_re_rank:
-        if gcn_model is not None:
-            print(f"Learned graph re-ranking")
-            distmat = graph_reranking(qf, gf, q_camids, g_camids, learn_based=True, gcn_model=gcn_model)
-        else:
-            print(f"Graph re-ranking")
-            distmat = graph_reranking(qf, gf, q_camids, g_camids)
-    else:
-        print(f"None re-ranking")
-        distmat =  torch.pow(qf, 2).sum(dim=1, keepdim=True).expand(m, n) + \
-                torch.pow(gf, 2).sum(dim=1, keepdim=True).expand(n, m).t()
-        distmat.addmm_(qf, gf.t(),beta=1, alpha=-2)
-        distmat = torch.sqrt(distmat).cpu().numpy()
+    distmat = compute_distmat(qf, gf, q_camids, g_camids, gcn_model=gcn_model, re_rank=re_rank, graph_re_rank=graph_re_rank, use_camera=use_camera)
 
     q_vids = torch.cat(q_vids, dim=0).cpu().numpy()
-    g_vids = torch.cat(g_vids, dim=0).cpu().numpy()   
-    
+    g_vids = torch.cat(g_vids, dim=0).cpu().numpy()
     del qf, gf
-    
-    cmc, mAP = eval_func(distmat, q_vids, g_vids, q_camids, g_camids, remove_junk=remove_junk)
 
+    cmc, mAP = eval_func(distmat, q_vids, g_vids, q_camids, g_camids, remove_junk=remove_junk)
     writer.write_scalars({"Accuraccy/CMC1": cmc[0], "Accuraccy/mAP": mAP}, epoch)
 
     return cmc, mAP
-
-def build_graphs_for_batch(feat, camids, k=20, gamma=2.0):
-    """
-    Xây dựng đồ thị động cho một Batch huấn luyện.
-    feat: (N, D) - Đặc trưng trích xuất từ Backbone
-    camids: (N,) - ID camera của từng ảnh trong batch
-    k: Số lượng lân cận gần nhất
-    """
-    # feat = torch.Tensor(feat)
-    N = feat.size(0)
-    device = feat.device
-
-    dist_mat = torch.cdist(feat.float(), feat.float(), p=2)
-
-    curr_k = min(k, N)
-    _, nn_idx = torch.topk(dist_mat, k=curr_k, largest=False)
-    
-    A_g = torch.zeros(N, N, device=device)
-    weights = torch.exp(-dist_mat / gamma)
-
-    src_values = weights.gather(1, nn_idx)
-    A_g.scatter_(1, nn_idx, src_values.to(A_g.dtype))
-
-    camids = camids.to(device)
-    camids = camids.view(-1, 1)
-    mask_cross = (camids != camids.T).float()
-    
-    A_c = A_g * mask_cross
-
-    def normalize(A):
-        row_sum = A.sum(1, keepdim=True)
-        A_norm = A / (row_sum + 1e-6)
-        return A_norm
-
-    return normalize(A_g), normalize(A_c)

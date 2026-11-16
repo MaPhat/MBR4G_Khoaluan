@@ -41,7 +41,7 @@ def eval_func(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50, remove_j
             q_camid = q_camids[q_idx]
             remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
         else:
-            remove = np.zeros_like(g_pids).astype(np.bool)
+            remove = np.zeros_like(g_pids).astype(bool)
         keep = np.invert(remove)
 
         # compute cmc curve
@@ -126,7 +126,7 @@ def worker(args):
     if remove_junk:
         remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
     else:
-        remove = np.zeros_like(g_pids).astype(np.bool)
+        remove = np.zeros_like(g_pids).astype(bool)
     keep = np.invert(remove)
 
     # compute cmc curve
@@ -167,7 +167,7 @@ def eval_func_th(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50, remov
             q_camid = q_camids[q_idx]
             remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
         else:
-            remove = np.zeros_like(g_pids).astype(np.bool)
+            remove = np.zeros_like(g_pids).astype(bool)
         keep = np.invert(remove)
 
         # compute cmc curve

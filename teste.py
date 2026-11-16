@@ -8,7 +8,7 @@ import numpy as np
 from metrics.eval_reid import *
 from data.triplet_sampler import *
 from typing import OrderedDict
-from processor import get_model, build_graphs_for_batch
+from processor import get_model, embed_for_retrieval, compute_distmat
 import torch.multiprocessing
 import os
 import yaml
@@ -74,137 +74,37 @@ def save_activ(activations, count_imgs, data, transform, path_names, blend_ratio
                             cv2.imwrite(outputDIR + 'mhsa_t_branch/' +str(count_imgs + i) + '.jpg', activ)
                     cnt += 1
 
-def test_epoch(model, device, dataloader_q, dataloader_g, model_arch, remove_junk=True, scaler=None, re_rank=False, graph_re_rank=False, learn_based=False, gcn_model=None):
-    if gcn_model is not None:
-        gcn_model.eval()
+def test_epoch(model, device, dataloader_q, dataloader_g, model_arch, remove_junk=True, scaler=None, re_rank=False, graph_re_rank=False, learn_based=False, gcn_model=None, use_camera=True):
+    """re_rank only           -> k-reciprocal
+       re_rank + graph_re_rank -> rule-based graph re-ranking
+       + learn_based (+ gcn)   -> LiteGCR on the full query+gallery graph"""
+    use_graph = bool(re_rank and graph_re_rank)
+    gcn = gcn_model if (use_graph and learn_based) else None
+    if gcn is not None:
+        gcn.eval()
     model.eval()
-    re_escala = torchvision.transforms.Resize((256,256), antialias=True)
+    device_type = "cuda" if device.type == "cuda" else "cpu"
 
-    # if data['dataset'] == 'VERIWILD':
-    #     queries_names = np.loadtxt('/home/eurico/VERI-Wild/train_test_split/test_3000_id_query.txt', dtype='str_')
-    #     galeria_names = np.loadtxt('/home/eurico/VERI-Wild/train_test_split/test_3000_id.txt', dtype='str_')
-    # else:
-    #     queries_names = np.loadtxt(data['query_list_file'], dtype='str_')
-    #     galeria_names = np.loadtxt(data['gallery_list_file'], dtype='str_')
-    ###needed lists
-    qf = []
-    gf = []
-    q_camids = []
-    g_camids = []
-    q_vids = []
-    g_vids = []
-    q_images = []
-    g_images =  []
-    count_imgs = 0
-    blend_ratio =0.3
-    with torch.no_grad():
-        for image, q_id, cam_id, view_id  in tqdm(dataloader_q, desc='Query infer (%)', bar_format='{l_bar}{bar:20}{r_bar}'):
-            
-            image = image.to(device)
-            
-            # Debug: Check input
-            if torch.isnan(image).any():
-                print(f"ERROR: NaN in input query images!")
-                
-            if scaler:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    _, _, ffs, activations = model(image, cam_id, view_id)
-            else:
-                _, _, ffs, activations = model(image, cam_id, view_id)
+    def extract(loader, desc):
+        feats, vids, cams = [], [], []
+        with torch.no_grad():
+            for image, vid, cam_id, view_id in tqdm(loader, desc=desc, bar_format='{l_bar}{bar:20}{r_bar}'):
+                image = image.to(device)
+                with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=bool(scaler)):
+                    _, _, ffs, _ = model(image, cam_id, view_id)
+                feats.append(embed_for_retrieval(ffs, keep_global_raw=gcn is not None).cpu())
+                vids.append(torch.as_tensor(vid))
+                cams.append(torch.as_tensor(cam_id))
+        return torch.cat(feats, 0), torch.cat(vids, 0).numpy(), torch.cat(cams, 0).numpy()
 
-            count_imgs += activations[0].shape[0]
-            end_vec = []
-            if gcn_model is not None:
-                from utils import normalize_adj
-                global_feature = ffs[0]
-                # Debug: Check features BEFORE GCN
-                if torch.isnan(global_feature).any():
-                    print(f"ERROR: NaN in query features BEFORE GCN!")
-                A_g, A_c = build_graphs_for_batch(global_feature, cam_id)
-                A_g_norm = normalize_adj(A_g)
-                A_c_norm = normalize_adj(A_c)
-                refined_global = gcn_model(global_feature, A_g_norm, A_c_norm)
-                ffs = [refined_global]
-            else:
-                # Debug: Check features when NOT using GCN
-                if torch.isnan(ffs[0]).any():
-                    print(f"ERROR: NaN in query features WITHOUT GCN!")
-            
-            for i, item in enumerate(ffs):
-                # Safe normalize with epsilon
-                normalized = F.normalize(item, p=2, dim=1, eps=1e-6)
-                end_vec.append(normalized)
-            
-            qf.append(torch.cat(end_vec, 1))
-            q_vids.append(q_id)
-            q_camids.append(cam_id)
+    qf, q_vids, q_camids = extract(dataloader_q, 'Query infer (%)')
+    gf, g_vids, g_camids = extract(dataloader_g, 'Gallery infer (%)')
 
-        del q_images
-        count_imgs = 0
-        for image, g_id, cam_id, view_id in tqdm(dataloader_g, desc='Gallery infer (%)', bar_format='{l_bar}{bar:20}{r_bar}'):
-            image = image.to(device)
-            if scaler:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    _, _, ffs, activations = model(image, cam_id, view_id)
-            else:
-                _, _, ffs, activations = model(image, cam_id, view_id)
-
-            # if not data['dataset'] == "VehicleID":
-            #     save_activ(activations, count_imgs, data, re_escala, galeria_names, blend_ratio, "_g")
-
-            end_vec = []
-            if gcn_model is not None:
-                from utils import normalize_adj
-                global_feature = ffs[0]
-                A_g, A_c = build_graphs_for_batch(global_feature, cam_id)
-                A_g_norm = normalize_adj(A_g)
-                A_c_norm = normalize_adj(A_c)
-                refined_global = gcn_model(global_feature, A_g_norm, A_c_norm)
-                ffs = [refined_global]
-            for item in ffs:
-                normalized = F.normalize(item, p=2, dim=1, eps=1e-6)
-                end_vec.append(normalized)
-            gf.append(torch.cat(end_vec, 1))
-            g_vids.append(g_id)
-            g_camids.append(cam_id)
-
-            count_imgs += activations[0].shape[0]
-
-        del g_images
-
-    qf = torch.cat(qf, dim=0)
-    gf = torch.cat(gf, dim=0)
-    q_camids = torch.cat(q_camids, dim=0).cpu().numpy()
-    g_camids = torch.cat(g_camids, dim=0).cpu().numpy()
-    q_vids = torch.cat(q_vids, dim=0).cpu().numpy()
-    g_vids = torch.cat(g_vids, dim=0).cpu().numpy()
-
-    m, n = qf.shape[0], gf.shape[0]
-    
-    if re_rank:
-        if graph_re_rank:
-            if learn_based:
-                print("Learn-based graph re-ranking")
-                distmat = graph_reranking(qf, gf, q_camids, g_camids,gcn_model=gcn_model)
-            else:
-                print(f"Graph re-raking")
-                distmat = graph_reranking(qf, gf, q_camids, g_camids)
-        else:
-            print("Re-ranking")
-            distmat = re_ranking(qf, gf, k1=80, k2=16, lambda_value=0.3)
-
-    else:
-        print("No Re-ranking")
-        distmat =  torch.pow(qf, 2).sum(dim=1, keepdim=True).expand(m, n) + \
-                torch.pow(gf, 2).sum(dim=1, keepdim=True).expand(n, m).t()
-        distmat.addmm_(qf, gf.t(),beta=1, alpha=-2)
-        distmat = torch.sqrt(distmat).cpu().numpy()
-    
+    distmat = compute_distmat(qf, gf, q_camids, g_camids, gcn_model=gcn,
+                              re_rank=re_rank and not graph_re_rank, graph_re_rank=use_graph,
+                              use_camera=use_camera)
     del qf, gf
-    
     cmc, mAP = eval_func(distmat, q_vids, g_vids, q_camids, g_camids, remove_junk=remove_junk)
-    # print(f'\nmAP = {mAP},  CMC1= {cmc[0]}, CMC5= {cmc[4]}')
-
     return cmc, mAP
 
 
@@ -270,7 +170,10 @@ if __name__ == "__main__":
         data_g = DataLoader(data_g, batch_size=data['BATCH_SIZE'], shuffle=False, num_workers=data['num_workers_teste'])
 
     path_weights = args.path_weights + 'best_CMC.pt'
-    gcn_path_weights = args.path_weights + 'gcn_model.pt'
+    # GCN weights saved together with best_CMC.pt (fallback: last epoch)
+    gcn_path_weights = args.path_weights + 'gcn_best_CMC.pt'
+    if not os.path.exists(gcn_path_weights):
+        gcn_path_weights = args.path_weights + 'gcn_model.pt'
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     print(f'Selected device: {device}')
 
@@ -282,11 +185,12 @@ if __name__ == "__main__":
     model = model.to(device)
     model.eval()
     
+    gcn_model = None
     if args.learn_based:
         # Get length feature
         input = torch.randn((32,3,256,256)).to(device)
         preds, embs, ffs, output = model(input, torch.randint(0,19,(32,1)).long().to(device), torch.randint(0,7,(32,8)).long().to(device))
-        feature_dim = embs[0].shape[1]
+        feature_dim = (ffs[0] if isinstance(ffs, (list, tuple)) else ffs).shape[1]
         # Create GCN on CPU, load, then move to GPU
         gcn_model = GCNRefiner(feature_dim=feature_dim)
         gcn_model.load_state_dict(torch.load(gcn_path_weights, map_location='cpu'))
@@ -300,25 +204,26 @@ if __name__ == "__main__":
         list_mAP = []
         list_cmc1 = []
         list_cmc5 = []
+        list_cmc10 = []
         for i in range(10):
-            reader = open('/home/eurico/VehicleID_V1.0/train_test_split/test_list_800.txt')
+            reader = open(os.path.join(os.path.dirname(os.path.normpath(data['ROOT_DIR'])), 'train_test_split', 'test_list_800.txt'))
             lines = reader.readlines()
             random.shuffle(lines)
             data_q = CustomDataSet4VehicleID_Random(lines, data['ROOT_DIR'], is_train=False, mode="q", transform=teste_transform, teste=True)
             data_g = CustomDataSet4VehicleID_Random(lines, data['ROOT_DIR'], is_train=False, mode="g", transform=teste_transform, teste=True)
             data_q = DataLoader(data_q, batch_size=data['BATCH_SIZE'], shuffle=False, num_workers=data['num_workers_teste'])
             data_g = DataLoader(data_g, batch_size=data['BATCH_SIZE'], shuffle=False, num_workers=data['num_workers_teste'])
-            if args.learn_based:
-                cmc, mAP = test_epoch(model, device, data_q, data_g, data['model_arch'], remove_junk=True, scaler=scaler, re_rank=args.re_rank, graph_re_rank=args.graph_re_rank, learn_graph=args.learn_based)
-            else:
-                cmc, mAP = test_epoch(model, device, data_q, data_g, data['model_arch'], remove_junk=True, scaler=scaler, re_rank=args.re_rank, graph_re_rank=args.graph_re_rank)
+            # VehicleID has no camera labels: LiteGCR cross-camera branch disabled
+            cmc, mAP = test_epoch(model, device, data_q, data_g, data['model_arch'], remove_junk=True, scaler=scaler, re_rank=args.re_rank, graph_re_rank=args.graph_re_rank, learn_based=args.learn_based, gcn_model=gcn_model, use_camera=False)
             list_mAP.append(mAP)
             list_cmc1.append(cmc[0])
             list_cmc5.append(cmc[4])
+            list_cmc10.append(cmc[9])
         mAP = sum(list_mAP) / len(list_mAP)
         cmc1 = sum(list_cmc1) / len(list_cmc1)
         cmc5 = sum(list_cmc5) / len(list_cmc5)
-        print(f'\n\nmAP = {mAP},  CMC1= {cmc1}, CMC5= {cmc5}')
+        cmc10 = sum(list_cmc10) / len(list_cmc10)
+        print(f'\n\nmAP = {mAP},  CMC1= {cmc1}, CMC5= {cmc5}, CMC10= {cmc10}')
         with open(args.path_weights +'result_map_l2_'+ str(l2) + '_mean_' + str(mean) +'.npy', 'wb') as f:
             np.save(f, mAP)
         with open(args.path_weights +'result_cmc_l2_'+ str(l2) + '_mean_' + str(mean) +'.npy', 'wb') as f:

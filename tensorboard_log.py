@@ -22,6 +22,9 @@ class Logger(object):
                 experience = './logs/' + data['dataset'] +'/'+ data['model_arch'] + '_LAI/' + str(exp)
             else:
                 experience = './logs/' + data['dataset'] +'/'+ data['model_arch'] + '/' + str(exp)
+        if data.get('log_dir'):
+            experience = data['log_dir']
+        os.makedirs(experience, exist_ok=True)
         self.logscalars = defaultdict(list)
         self.writer = SummaryWriter(experience)
         self.save_embed = save_embed
@@ -50,11 +53,14 @@ class Logger(object):
         self.writer.close()
 
     def save_model(self, model, gcn_model=None):
-        if len(self.logscalars['Accuraccy/mAP']) > 1:
-            if self.logscalars['Accuraccy/mAP'][-1] >= np.max(self.logscalars['Accuraccy/mAP'][:-1]):
-                torch.save(model.state_dict(), self.savepath  + '/' + 'best_mAP' +'.pt')
-            if self.logscalars['Accuraccy/CMC1'][-1] >= np.max(self.logscalars['Accuraccy/CMC1'][:-1]):
-                torch.save(model.state_dict(), self.savepath  + '/' + 'best_CMC' +'.pt')
+        def is_best(key):
+            hist = self.logscalars[key]
+            return len(hist) == 1 or hist[-1] >= np.max(hist[:-1])
+        for key, name in [('Accuraccy/mAP', 'best_mAP'), ('Accuraccy/CMC1', 'best_CMC')]:
+            if len(self.logscalars[key]) and is_best(key):
+                torch.save(model.state_dict(), self.savepath + '/' + name + '.pt')
+                if gcn_model is not None:
+                    torch.save(gcn_model.state_dict(), self.savepath + '/gcn_' + name + '.pt')
         torch.save(model.state_dict(), self.savepath  + '/' + 'last' +'.pt')
         if gcn_model is not None:
             torch.save(gcn_model.state_dict(), self.savepath  + '/' + 'gcn_model' +'.pt')

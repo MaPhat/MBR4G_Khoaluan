@@ -98,6 +98,8 @@ if __name__ == "__main__":
     if args.mean_losses is not None: data['mean_losses'] = bool(args.mean_losses)
 
 
+    early_stopping = EarlyStopping(patience=data.get('early_stopping_patience', 5), delta=0)
+
     alpha_ce= data['alpha_ce']
     beta_tri = data['beta_tri']
 
@@ -130,9 +132,11 @@ if __name__ == "__main__":
 
     #### Dataset Loading       
     if data['dataset']== "VehicleID":
-        data_q = CustomDataSet4VehicleID('/Users/maphat/Desktop/khoaluan/VehicleID_V1.0/train_test_split/test_list_800.txt', data['ROOT_DIR'], is_train=False, mode="q", transform=teste_transform)
-        data_g = CustomDataSet4VehicleID('/Users/maphat/Desktop/khoaluan/VehicleID_V1.0/train_test_split/test_list_800.txt', data['ROOT_DIR'], is_train=False, mode="g", transform=teste_transform)
-        data_train = CustomDataSet4VehicleID("/Users/maphat/Desktop/khoaluan/VehicleID_V1.0/train_test_split/train_list.txt", data['ROOT_DIR'], is_train=True, transform=train_transform)
+        # ROOT_DIR = <VehicleID_V1.0>/image  ->  split lists in <VehicleID_V1.0>/train_test_split
+        vid_split_dir = os.path.join(os.path.dirname(os.path.normpath(data['ROOT_DIR'])), 'train_test_split')
+        data_q = CustomDataSet4VehicleID(os.path.join(vid_split_dir, 'test_list_800.txt'), data['ROOT_DIR'], is_train=False, mode="q", transform=teste_transform)
+        data_g = CustomDataSet4VehicleID(os.path.join(vid_split_dir, 'test_list_800.txt'), data['ROOT_DIR'], is_train=False, mode="g", transform=teste_transform)
+        data_train = CustomDataSet4VehicleID(os.path.join(vid_split_dir, 'train_list.txt'), data['ROOT_DIR'], is_train=True, transform=train_transform)
         data_train = DataLoader(data_train, sampler=RandomIdentitySampler(data_train, data['BATCH_SIZE'], data['NUM_INSTANCES']), num_workers=data['num_workers_train'], batch_size = data['BATCH_SIZE'], collate_fn=train_collate_fn, pin_memory=True)#
         data_q = DataLoader(data_q, batch_size=data['BATCH_SIZE'], shuffle=False, num_workers=data['num_workers_teste'])
         data_g = DataLoader(data_g, batch_size=data['BATCH_SIZE'], shuffle=False, num_workers=data['num_workers_teste'])
@@ -179,7 +183,8 @@ if __name__ == "__main__":
         # Get length feature
         input = torch.randn((32,3,256,256)).to(device)
         preds, embs, ffs, output = model(input, torch.randint(0,19,(32,1)).long().to(device), torch.randint(0,7,(32,8)).long().to(device))
-        feature_dim = embs[0].shape[1]
+        # LiteGCR refines the global triplet feature ffs[0]
+        feature_dim = (ffs[0] if isinstance(ffs, (list, tuple)) else ffs).shape[1]
         gcn_model = GCNRefiner(feature_dim=feature_dim).to(device)
         print(f"\n==> GCN Model created with feature_dim={feature_dim}")
         print(f"==> GCN trainable parameters: {count_parameters(gcn_model)}")
@@ -252,6 +257,9 @@ if __name__ == "__main__":
         print("\nFroze Backbone before branches!")
   
 
+    # VehicleID has no camera labels: LiteGCR cross-camera branch disabled (A_c = 0, alpha = 1)
+    use_camera = data['dataset'] != 'VehicleID'
+
     ## Training Loop
     for epoch in range(data['num_epochs']):
         print(f"\n{'='*50}")
@@ -286,7 +294,7 @@ if __name__ == "__main__":
         ### Train Loop
         if args.learn_graph:
             print(f"==> Training with GCN | alpha={gcn_model.alpha.item():.4f} | LR={optimizer.param_groups[-1]['lr']:.6f}")
-            train_loss, c_loss, t_loss, alpha_ce, beta_tri = train_epoch(model, device, data_train, loss_fn, metric_loss, optimizer, data, alpha_ce, beta_tri, logger, epoch, scheduler, scaler, gcn_model)
+            train_loss, c_loss, t_loss, alpha_ce, beta_tri = train_epoch(model, device, data_train, loss_fn, metric_loss, optimizer, data, alpha_ce, beta_tri, logger, epoch, scheduler, scaler, gcn_model, use_camera=use_camera)
         else:
             print(f"Traditional training")
             train_loss, c_loss, t_loss, alpha_ce, beta_tri = train_epoch(model, device, data_train, loss_fn, metric_loss, optimizer, data, alpha_ce, beta_tri, logger, epoch, scheduler, scaler)
@@ -294,7 +302,7 @@ if __name__ == "__main__":
         ###Evaluation
         # if epoch%data['validation_period']==0 or epoch>=data['num_epochs']-15:
         if args.learn_graph:
-            cmc, mAP = test_epoch(model, device, data_q, data_g, data['model_arch'], logger, epoch, remove_junk=True, scaler=scaler, gcn_model=gcn_model, re_rank=args.re_rank)
+            cmc, mAP = test_epoch(model, device, data_q, data_g, data['model_arch'], logger, epoch, remove_junk=True, scaler=scaler, gcn_model=gcn_model, re_rank=args.re_rank, use_camera=use_camera)
             logger.save_model(model, gcn_model)
         else:
             cmc, mAP = test_epoch(model, device, data_q, data_g, data['model_arch'], logger, epoch, remove_junk=True, scaler=scaler, re_rank=args.re_rank)
